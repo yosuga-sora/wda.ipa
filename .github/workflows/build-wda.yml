@@ -1,0 +1,86 @@
+name: Build WebDriverAgent unsigned IPA
+
+# 在 GitHub 的 macOS runner 上编译 appium/WebDriverAgent，产出可直接丢给
+# Sideloadly 签名安装的 WebDriverAgentRunner.ipa。
+# 编译命令与官方 Scripts/ci/build-real.sh 一致（真机 Arm64、不签名、排除顶层 Frameworks）。
+#
+# 用法：放到你自己 GitHub 仓库的 .github/workflows/ 目录，到 Actions 页手动 Run。
+# 公开仓库的 macOS runner 不计费；私有仓库按分钟计费（macOS 有 10 倍倍率）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'WebDriverAgent 的 tag 或分支（默认 master）'
+        required: false
+        default: 'master'
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: 打印工具链版本
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: 指定 Xcode 16.4
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.4'
+
+      - name: 拉取 WebDriverAgent 源码
+        run: |
+          git clone --depth 1 --branch "${{ inputs.ref }}" \
+            https://github.com/appium/WebDriverAgent.git wda
+          cd wda && git log -1 --oneline
+
+      - name: 编译 WebDriverAgentRunner（真机 arm64，未签名）
+        working-directory: wda
+        run: |
+          set -euo pipefail
+          xcodebuild clean build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -derivedDataPath "$PWD/derived" \
+            -scheme WebDriverAgentRunner \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 \
+            2>&1 | tail -n 60
+
+      - name: 打包成 ipa
+        run: |
+          set -euo pipefail
+          APP="wda/derived/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+          if [ ! -d "$APP" ]; then
+            echo "未找到预期产物，实际产物如下：" >&2
+            find wda/derived -maxdepth 6 -name '*.app' -type d >&2
+            exit 1
+          fi
+
+          echo "== 产物内容 =="
+          ls -la "$APP"
+          echo "== 嵌套的 xctest 与 framework =="
+          find "$APP" -maxdepth 4 -name '*.framework' -o -maxdepth 4 -name '*.xctest' | sort
+
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/
+
+          # 真机构建要排除 runner 顶层 Frameworks 中的库副本，
+          # 让 XCTest 从设备端的开发者支持库解析。
+          # PlugIns/*.xctest/Frameworks 里的 WebDriverAgentLib 必须保留。
+          zip -qry WebDriverAgentRunner.ipa Payload \
+            -x "Payload/WebDriverAgentRunner-Runner.app/Frameworks/*"
+
+          ls -lh WebDriverAgentRunner.ipa
+          echo "== ipa 内结构（前 40 行）=="
+          unzip -l WebDriverAgentRunner.ipa | head -n 40
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebDriverAgentRunner-ipa
+          path: WebDriverAgentRunner.ipa
+          if-no-files-found: error
